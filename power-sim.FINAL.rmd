@@ -1,0 +1,609 @@
+---
+title: "Modeling of case-area targeted interventions for a cholera outbreak and study simulation to estimate power"
+authors: "Flavio Finger, epicentre MSF, Ruwan Ratnayake, LSHTM"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: sandstone
+    code_folding: "show"
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable 
+    keep_md: true 
+---
+
+Code adapted from the bpmodels package <https://github.com/sbfnk/bpmodels> and <http://disjointedthinking.jeffhughes.ca/2017/09/power-simulations-r>
+
+# Setup
+
+## Environment
+
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  include = TRUE,
+  warning = TRUE,
+  message = TRUE,
+  fig.width = 7,
+  fig.height = 4
+  )
+```
+
+
+## Standard packages
+```{r, results='hide', message=FALSE}
+library(tidyverse)
+library(magrittr)
+library(plyr)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(ggsci)
+library(lme4)
+library(MuMIn)
+library(MASS)
+if("dplyr" %in% (.packages())){
+  detach("package:dplyr", unload=TRUE) 
+  detach("package:plyr", unload=TRUE) 
+} 
+theme_set(theme_bw())   
+colors <- pal_nejm()(8)
+```
+
+
+# Branching process model 
+
+- Load the branching process modelling package (bpmodels/sbfnk).
+- Newest versions contain an additional simulator which can take depletion of susceptibles in final populations into account.
+- The package has a new branch to add an argument which can change transmission parameters during simulation (written by Flavio). This feature will be used to simulate CATI interventions
+
+```{r, results='hide'}
+## Get the interventions branch from my bpmodels fork (rebuild to make sure we have newest version)
+#renv::install("ffinger/bpmodels@interventions", rebuild = TRUE)
+## GET THE LOCAL DEVELOPMENT VERSION INSTEAD
+#devtools::load_all("/home/ffinger/Work/archive/academic/R_packages/bpmodels")
+library(bpmodels)
+```
+
+*Initialize the random number generator for reproducibility*
+```{r, results='hide'}
+set.seed(87)
+```
+
+*Set sample size of rings (N=10000)*
+```{r}
+n_rings <- 10000
+```
+
+## Serial Interval
+- Source: Azman et al. (2016) Population-level effect of OCV, South Sudan (https://dx.doi.org/10.3201/eid2206.151592)
+
+```{r}
+  mn <- 5 #mean of SI
+  sd <- 8 #standard deviation of SI
+  si_shape <- (mn / sd)^2 # alpha
+  si_rate <- mn / (sd^2) # beta
+  si <- function(x) rgamma(x, shape = si_shape, rate = si_rate)
+```
+
+Illustration:
+```{r}
+si_sample <- tibble(serial_interval = si(1000))
+summary(si_sample)
+
+ggplot(si_sample) +
+  geom_density(
+    aes(serial_interval),
+    col = colors[1],
+    fill = colors[1],
+    alpha = .3
+  )
+```
+
+## R0 and its dispersion
+- Assume negative binomial distribution with mean R0 and dispersion disp.
+- Source: Azman et al. (2016) Population-level effect of OCV, South Sudan (https://dx.doi.org/10.3201/eid2206.151592)
+- Use R0 (2, 1.5) and D (1.5, 1)
+```{r}
+  R0 <- 2
+  disp <- 1.5
+```
+
+Illustration:
+```{r}
+r0_sample <- tibble(r0 = rnbinom_mean_disp(1000, R0, disp))
+
+summary(r0_sample)
+
+ggplot(r0_sample) +
+  geom_bar(
+    aes(r0),
+    col = colors[1],
+    fill = colors[1],
+    alpha = .3
+  )
+```
+
+## Population and initial immune
+- Assume large high-density rings of mean 500 persons
+- Can adjust these rings to be smaller as well (see alternative approach below)
+- Assume no prior vaccination or infection conferring immunity
+```{r}
+  all_pop <- rnorm(n_rings, mean=500, sd=50)
+
+#Alternate method of partioning sample into larger and small rings
+#all_pop1 <- rnorm((n_rings/2), mean=500, sd=50)
+#all_pop2 <- rnorm((n_rings/2), mean=300, sd=30)
+#all_pop <- append(all_pop1, all_pop2)
+
+  initial_immune <- 0  
+```
+   
+## Delay from onset of symptoms of index case to reporting a case
+*Assume a shorter delay to reporting after implementation of CATI*
+```{r}
+onset_to_report_before_CATI <- function(n = 1) rpois(n, 1)
+onset_to_report_after_CATI <- function(n = 1) rpois(n, 0.5)
+```
+
+## Delay between reporting of the index case and start of CATI implementation
+```{r}
+CATI_delays <- function(n = 1) rpois(n, 3) 
+```
+
+Illustration:
+```{r}
+n = 1e4
+CATI_delay_samples <- tibble(
+    natural = CATI_delays(n),
+) %>% 
+pivot_longer(everything())
+
+ggplot(CATI_delay_samples) +
+    geom_bar(aes(value, fill = name), position = "dodge") +
+    facet_wrap(~name, ncol = 1) +
+    scale_fill_nejm()
+
+#CATI_delay_samples %>% 
+#    count(value) %>% 
+#    mutate(Freq = n/sum(n))  
+```
+
+## Duration of CATI 
+*Time it takes from starting the intervention to it being completed (check with Flavio)*
+```{r}
+CATI_dur <- 1
+```
+
+## Effectiveness of CATI interventions
+- ACP, Reveiz 2011, meta-analysis, https://doi.org/10.1371/journal.pone.0027060
+- POUWT, Fewtrell, 2005, meta-analysis, https://doi.org/10.1016/S1473-3099(04)01253-8
+- Safe storage, Roberts 2001, RCT, https://scielosp.org/article/bwho/2001.v79n4/280-287/
+- Single dose OCV, 2 month, Azman, 2015, case-cohort study,
+https://doi.org/10.1016/S2214-109X(16)30211-X
+- Coverage is kept at 80% 
+- Effectiveness is estimated as (coverage * cumulative effects of interventions) for each phases where given intervention(s) have an effect
+  
+```{r}
+# Estimates of reduction of R0
+  antibiotic.eff <- 0.66  #ACP efficacy
+  water.tx.eff   <- 0.26  #POUWT efficacy
+  water.store.eff<- 0.21  #Safe storage efficacy
+  vacc.2m.eff    <- 0.87  #Single-dose OCV efficacy 
+  pop.cover      <- 0.8   #Coverage at the population level  
+
+  ## Phase 1 (WASH, antibiotics, OCV applied to entire ring but OCV does   not take effect until Phase 3)
+  cati.efficacy.wash.ab <- 1-(
+    (1-antibiotic.eff)*
+      (1-water.tx.eff)*
+      (1-water.store.eff)
+  )
+  cati.effectiveness.wash.ab <- pop.cover*cati.efficacy.wash.ab
+  
+  ## Phase 2 (WASH only, as antibiotics have worn off after 2 days)
+  cati.efficacy.wash     <- 1-(
+    # (1-antibiotic.eff)*
+    (1-water.tx.eff)*
+      (1-water.store.eff)
+  )
+  cati.effectiveness.wash <- pop.cover*cati.efficacy.wash
+  
+  ## Phase 3 (WASH only, antibiotics worn off, vaccination takes effect)
+  cati.efficacy.vacc_wash <- 1-(
+    (1-vacc.2m.eff)*
+      # (1-antibiotic.eff)*
+      (1-water.tx.eff)*
+      (1-water.store.eff)
+  )
+  cati.effectiveness.vacc_wash <- pop.cover*cati.efficacy.vacc_wash
+```
+
+## Function to apply CATI effect
+- This function takes the parameters of the offspring distribution (negative binomial with R0 and dispersion) and modifies them according to interventions. 
+- Assume that CATI interventions reduce R0 by a multiplicative factor.
+
+```{r}
+apply_CATI <- function(t, pop, offspring_params, arguments) {
+    if (t <= arguments$t_end_CATI) {
+      x <- 1 #no effect
+    } else if (t <= arguments$t_end_CATI + arguments$delay_start_WASHonly_eff) {
+      x <- arguments$eff_wash.ab
+    } else if (t <= arguments$t_end_CATI + arguments$delay_start_vacc_eff) {
+      x <- arguments$eff_no_vacc
+    } else {
+      x <- arguments$eff_vacc
+    }
+    
+#offspring_params$mn_offspring = x * offspring_params$mn_offspring #CATI directly reduces the mean of R
+offspring_params$susc <- round(offspring_params$susc*x) 
+#alternatively could reduce the number of susceptibles
+    return(offspring_params)
+  }
+``` 
+
+*Additional arguments given to the CATI application function describe the CATI effects before and after the onset (and removal) of the effect of antibiotics and onset of the effect of vaccination as well as the timings*
+```{r}
+  adj_args <- list(
+    eff_wash.ab = cati.effectiveness.wash.ab,
+    delay_start_WASHonly_eff = 2,
+    eff_no_vacc = cati.effectiveness.wash,
+    delay_start_vacc_eff = 7,
+    eff_vacc = cati.effectiveness.vacc_wash
+  )
+``` 
+
+## Timing
+*These are ONSET dates, not report dates*
+```{r}
+  t0 <- 0 #start of simulation (onset date)
+```
+
+*Define times for each simulation*
+```{r}
+all_times_to_report_index_case <- t0 + onset_to_report_before_CATI(n_rings) ## Onset of index to report of index
+all_CATI_delays <- CATI_delays(n_rings) ## Reporting of index to start of CATI
+all_t_start_CATI <- all_CATI_delays + all_times_to_report_index_case    ## Onset of index to start CATI
+all_t_end_CATI <- all_t_start_CATI + CATI_dur ## Onset of index to end CATI
+```
+
+*The end date of the observation period must be 30 days after reporting of the index*
+```{r}
+followup_duration <- 30
+  tf <- followup_duration + max(all_times_to_report_index_case) 
+  #end of simulation (followup duration from report of index)
+```
+
+- Add time to reporting of each case (in addition to time of onset, which is simulated) 
+- First run through chains and then chain summaries per ring
+- use Poisson distribution if D=1.0
+```{r, chains}
+chains <- tibble()
+  
+  for (i in seq(1,n_rings)) {
+   adj_args$t_end_CATI <- all_t_end_CATI[i]
+     new_chain <- 
+      chain_sim_susc(
+        "nbinom",
+        mn_offspring = R0,
+        disp_offspring = disp,
+        serial = si,
+        t0 = t0,
+        tf = tf,
+        pop = all_pop[i],
+        initial_immune = initial_immune,
+        adjust_parameters = apply_CATI,
+        adjust_arguments = adj_args  
+      )
+    
+    new_chain$chain_id <- i
+     
+    new_chain %<>% mutate(
+      all_pop[i],
+      pop.cover,
+      all_times_to_report_index_case[i],
+      time = round(time),
+      time_report = case_when(
+        generation == 1 ~ as.double(all_times_to_report_index_case[i]),
+        time < all_t_end_CATI[i] ~ time + onset_to_report_before_CATI(n()),
+        time >= all_t_end_CATI[i] ~ time + onset_to_report_after_CATI(n()),
+      ),
+      time_report_since_index = time_report - all_times_to_report_index_case[i], #delay between reporting of index and reporting of case
+      CATI_start_time = all_t_start_CATI[i],
+      CATI_end_time = all_t_end_CATI[i],
+      CATI_delay = all_CATI_delays[i], #reporting of index to start of CATI
+    ) %>%
+      rename(
+        time_onset = time,
+        patient_id = id
+      ) %>%
+     filter(time_report_since_index <= followup_duration
+            , time_report_since_index >= 0)
+            #, time_report_since_index <= 30)
+            #include only cases between reporting of index and followup_dur.
+            # it's possible that by the time the index gets reported other cases have already occurred
+          
+    chains <- bind_rows(chains, new_chain)
+  }
+
+  chains %<>%
+    select(chain_id, everything())
+```
+
+*Inspect output*
+```{r}
+  head(chains)
+```
+*Setup the random effect as a heterogeneity factor*
+```{r}
+rand_eff_het <- rnbinom(10000, size = 10, prob = 0.8)
+hist(rand_eff_het)
+                                          
+```
+
+*Summarize chains into a summary of each ring and a random effects related to surveillance capacity*
+```{r, chain_summary}
+  chain_summary <- chains %>%
+    group_by(chain_id, CATI_delay) %>%
+    summarize(
+      last_case_report = max(time_report_since_index),
+      cases = n(),
+    ) %>%
+    ungroup() %>%
+    mutate(
+      population = all_pop,
+      delay_detection = all_times_to_report_index_case,
+      Rt = R0*((all_pop[i]-cases)/(all_pop[i])),
+      coverage = pop.cover,
+      CATI_delay_cat = if_else(CATI_delay >= 3, ">=3", "<3"),
+      rand_eff_district_surv = case_when(
+            delay_detection == 0 ~ "1",
+            delay_detection == 1 ~ "2",
+            delay_detection >= 1 ~ "3",
+            TRUE ~ "0"),
+      rand_eff_het = rand_eff_het
+      )
+  
+  chain_summary$rand_eff_district_surv %<>% as.numeric 
+  
+```
+
+*Inspect output*
+```{r}
+  head(chain_summary)
+## Describe delay categories 
+  (rings_by_delay <-chain_summary %>% 
+    count(CATI_delay) %>% 
+    mutate(Freq = n/sum(n)))  
+## Describe case counts by delay categories
+  (rings_by_case_count <-group_by(chain_summary, CATI_delay) %>% 
+    summarize(mean_case_count = mean(cases)))
+```
+
+## Graphs
+- Graph 1: Rings by case counts
+- Graph 2: Incidence density by delay (<3 days or ≥3days)
+- Graph 3: Last case in chain, by day
+```{r}
+# Graph 1
+rings_by_case_count %>%
+  ggplot(aes(CATI_delay, mean_case_count))+
+  geom_col()
+# Graph 2 
+  ggplot(chain_summary) +
+    geom_density(aes(cases, fill = CATI_delay_cat, col = CATI_delay_cat), alpha = .3)
+# Graph 3
+ggplot(chain_summary) +
+    geom_bar(aes(last_case_report, fill = CATI_delay_cat, col = CATI_delay_cat), alpha = .3) +
+    facet_wrap(~CATI_delay_cat, ncol = 1)
+# Graph 4
+ggplot(chain_summary) +
+  geom_bar(aes(rand_eff_district_surv))
+# Graph 5
+ggplot(chain_summary) +
+  geom_bar(aes(rand_eff_het)) 
+#chain_summary %>% 
+#  count(rand_eff_Rt_zscore) %>% 
+#  mutate(percent = n / sum(n)*100)
+
+```
+
+## Outputs
+```{r}
+saveRDS(chains, "chains.rds")
+saveRDS(chain_summary, "chain_summary.rds")
+write.csv(chain_summary, "chain_summary.csv")
+```
+
+
+# Generalised linear mixed-effect model of impact of CATI  
+
+- Bring outputs from branching process model into GLMM regression
+- This is a function to run a GLMM which regresses case counts on delay to CATI implementation. Choose a value for *n_rings_power* to randomly sample the value from 10000 modeled rings. In the power simulation below, power can be evaluated across a range of sample sizes.
+- GLMM regression estimates the response variable (incidence in ring) associated with the main exposure (delay to CATI implementation). 
+
+1. *Fixed effects* quantify overall effects (delay to implementation, coverage [excluded for simplicity])
+
+2. *Offset* (log(population)) as caseload is proportional to population size
+
+3. *Random effects* quantify variation across rings of the fixed effects (delay to index case detection)
+
+4. *Confounders* exclude confounders for simplicity (e.g., accessibility of ring-site by road, average daily rainfall at ring-site)
+
+```{r, pilot_study_function}
+pilot_study <- function(simNum, n_rings_power){
+
+# Randomly-select rings for power simulation 
+power_sample <- sample_n(chain_summary, n_rings_power, replace=FALSE) 
+
+#Construct the GLMM regression model
+  y.cases          <- power_sample$cases
+  x1.delay         <- power_sample$CATI_delay
+  x2.coverage      <- power_sample$coverage
+  x3.population    <- power_sample$population
+  x4.rand.eff.dist <- factor(power_sample$rand_eff_district_surv, 
+                             labels = c("1", "2", "3"))
+  x5.rand.eff.het  <- power_sample$rand_eff_het
+  x1.delay.cat     <- power_sample$CATI_delay_cat
+
+# Assemble dataset for n_rings number of rings  
+  cati.sim <- data.frame(y.cases, x1.delay, x1.delay.cat, x2.coverage,
+                        x3.population, x4.rand.eff.dist, x5.rand.eff.het)
+
+summary(model.sim <- glmer.nb(y.cases ~ x1.delay 
+                     # + x2.coverage 
+                     # + distance + mean_rainfall
+                     + offset(log(x3.population))
+                     + (1|x4.rand.eff.dist)
+                     #+ (1|x5.rand.eff.het)
+                     , data=cati.sim
+                     ))  
+output <- summary(model.sim)$coefficients
+coefs <- output[, 1]
+ps <- output[, 4]
+
+#Check model fit
+op <- par(mfrow=c(2,2)) 
+model.fit <- plot(model.sim)
+
+#Examine sum of squares of Pearson residuals, degrees of freedom, overdispersion
+resid.ssq <- sum(residuals(model.sim,type="pearson")^2)  
+resid.df <- nrow(cati.sim)-length(coef(model.sim)) 
+overdisp <- (resid.ssq/resid.df) # ratio should be approx 1
+
+#Calculate confidence intervals
+CIwald <- confint(model.sim, method = "Wald")
+
+(results <- c(coefs, ps, overdisp, CIwald))
+names(results) <- c('b0.coef', 'b1.coef', 'b0.p', 'b1.p', 'overdisp', 'sig.2.5%', 'b0.CI, 2.5%', 'b1.CI, 2.5%', 
+            'sig.97.5%', 'b0.CI, 97.5%', 'b1.CI, 97.5%')
+
+return(results)
+
+}
+```
+
+## Assess model fit and coefficients
+- b1.coef is a rate of change in caseload by delay (because of offset)
+- Look for a dispersion ratio which is approximately equal to 1
+- Check plot of cases by delays, with GLMM by random effect
+- Compare R^2 between GLM (R2m) and GLMM (R2c) to assess added value of random effect
+- Check independence of residuals*
+- Check confidence intervals (if gigantic, this could indicate a fitting problem)
+
+```{r, model_fit}
+pilot_study(n_rings_power=250)
+
+power_sample <- sample_n(chain_summary, 10000, replace=FALSE) 
+  y.cases          <- power_sample$cases
+  x1.delay         <- power_sample$CATI_delay
+  x2.coverage      <- power_sample$coverage
+  x3.population    <- power_sample$population
+  x4.rand.eff.dist <- factor(power_sample$rand_eff_district_surv, 
+                             labels = c("1", "2", "3"))
+  x5.rand.eff.het  <- factor(power_sample$rand_eff_het)
+  x1.delay.cat     <- power_sample$CATI_delay_cat
+  
+  cati.sim <- data.frame(y.cases, x1.delay, x1.delay.cat, x2.coverage,
+                        x3.population, x4.rand.eff.dist, 
+                        x5.rand.eff.het)
+
+#Boxplot of attack rates by delay (with predicted regression line)  
+ggplot(cati.sim, aes(x=(factor(x1.delay)), 
+                     y=( (y.cases/x3.population)*1000))) +
+  geom_boxplot(col = colors[5],
+               fill = colors[5],
+               alpha = 0.1) +
+  geom_smooth(aes(x1.delay, y=(y.cases/x3.population)*1000),
+              method=glm, linetype="dashed", size = 0.3, 
+              col = colors[3], fill = colors[3], alpha = 0.1) +
+  coord_cartesian(xlim = c(0, 9)) +
+  scale_y_continuous(trans="log10", 
+                     breaks = c(0, 100, 200, 300, 400, 500, 600)) +
+  xlab("Delay to CATI (days)") + 
+  ylab("Attack rate per 1000 population") +
+  theme_bw(base_size = 12)
+  theme(axis.line = element_line(colour = "black"),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank()) 
+ggsave("delay.attackrate.tiff", dpi=300, units="in", width=8.3, height=5.9)
+
+
+#Compare fit with and without random effects (i.e., GLMM vs GLM)
+fitm <- glmer.nb(y.cases ~ x1.delay + offset(log(x3.population)) + (1|x4.rand.eff.dist), data=cati.sim)
+fit <- glm.nb(y.cases ~ x1.delay + offset(log(x3.population)),data=cati.sim)
+r.squaredGLMM(fitm)
+
+#Check independence of fitted values and residuals
+plot(fitm)
+plot(fitm, x4.rand.eff.dist~resid(.))
+```
+
+
+# Simulation to estimate power 
+## Simulation to estimate power (for a single sample size)
+
+*Suggest using a sample size of rings equivalent to large CATI programs in Haiti (n=120) and Nepal (n=170)*
+
+- Michel et al. (2019) Estimating effectiveness of CATI interventions against cholera in Haiti (https://doi.org/10.7554/eLife.50243)
+- Roskosky et al.(2019) CATI feasibility in the Kathmandu Valley, Nepal
+(https://doi.org/10.4269/ajtmh.18-0863)
+- Uses core logic of {paramtest} package to run a function iteratively and collate the results
+
+```{r, ss1, message=FALSE, warning=FALSE}
+number_sims <- 1000 #set number of simulations to >=1000
+start_time <- Sys.time() #log start time for simulation
+simulations <- map_dfr(1:number_sims, pilot_study, n_rings_power=80) 
+#run pilot study up to the number of simulations 
+(power <- sum(simulations$b1.p < 0.05) / nrow(simulations)) 
+#calculate power
+prop.test((power*100), 100)
+#estimate 95% CIs for power estimate
+end_time <- Sys.time() #log end time for simulation
+end_time - start_time #calculate time for simulation
+```
+
+## Simulation to estimate power (for a range of sample sizes)
+
+*Suggest using N=50 to 150 rings based on feasibility*
+
+```{r, ss2, message=FALSE, warning=FALSE}
+number_sims <- 10
+proposed_sample_sizes <- c(50, 75, 100, 125, 150)
+results <- NULL
+start_time <- Sys.time() #log start time for simulation
+for (value in proposed_sample_sizes) {
+  simulations <- map_dfr(1:number_sims, pilot_study, n_rings_power=value)
+  simulations$n <- value
+  results <- rbind(results, simulations)
+}
+end_time <- Sys.time() #log end time for simulation
+end_time - start_time #calculate time for simulation
+```
+
+*Estimate power across sample sizes*
+```{r} 
+(power_ests <- results %>%
+    group_by(n) %>%
+    summarize(power=sum(b1.p < 0.05)/n())
+)
+```
+
+##Visualize power by sample size
+```{r} 
+power_ests %>%
+  ggplot(aes(x=n, y=power, 
+             col = colors[1], 
+             alpha = 1.5)) +
+  geom_line(color="black") +
+  geom_point(shape=21, color="black", fill= colors[1], size=4) +
+  geom_hline(yintercept=.8, linetype="dashed", color = "red") +
+  geom_hline(yintercept=.9, linetype="dashed", color = "grey") +
+  ylim(c(0,1)) +
+  scale_x_continuous(breaks=seq(50, 150, 25)) +
+  theme(legend.position = "none") +
+  labs(x="Number of rings", y="Power")
+ggsave("power.tiff", dpi=300, units="in", width=8.3, height=5.9)
+```
